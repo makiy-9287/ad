@@ -30,6 +30,8 @@ class FootprintCandle:
     row_size: float = 1.0
     is_closed: bool = False
     has_footprint: bool = False
+    min_agg_id: Optional[int] = None
+    max_agg_id: Optional[int] = None
 
     # bucket_price -> [bid_vol (sell aggressor), ask_vol (buy aggressor)]
     rows: Dict[float, List[float]] = field(default_factory=dict)
@@ -44,31 +46,42 @@ class FootprintCandle:
     buy_imbalances: List[float] = field(default_factory=list)
     sell_imbalances: List[float] = field(default_factory=list)
     stacked_zones: List[Dict[str, Any]] = field(default_factory=list)
-    absorption: Optional[str] = None         # "BULL" | "BEAR" | None
+    absorption: Optional[str] = None
     absorption_price: Optional[float] = None
-    trapped: Optional[str] = None            # "TRAPPED_SHORTS" | "TRAPPED_LONGS" | None
+    trapped: Optional[str] = None
     trapped_zone: Optional[Tuple[float, float]] = None
     unfinished_high: bool = False
     unfinished_low: bool = False
-    divergence: Optional[str] = None         # "BULL_DIV" | "BEAR_DIV" | None
-    liq_buy_usd: float = 0.0                 # Shorts liquidated (buy forceOrder)
-    liq_sell_usd: float = 0.0                # Longs liquidated (sell forceOrder)
+    divergence: Optional[str] = None
+    liq_buy_usd: float = 0.0
+    liq_sell_usd: float = 0.0
+    _dirty: bool = False
 
-    def add_trade(self, price: float, qty: float, is_buyer_maker: bool) -> None:
+    def add_trade(self, price: float, qty: float, is_buyer_maker: bool, agg_id: Optional[int] = None) -> None:
+        if agg_id is not None:
+            if self.min_agg_id is not None and self.max_agg_id is not None:
+                if self.min_agg_id <= agg_id <= self.max_agg_id:
+                    return
+            if self.min_agg_id is None or agg_id < self.min_agg_id:
+                self.min_agg_id = agg_id
+            if self.max_agg_id is None or agg_id > self.max_agg_id:
+                self.max_agg_id = agg_id
+
         if self.row_size <= 0:
             self.row_size = compute_row_size(self.symbol, price, self.tf)
         bucket = snap_bucket(price, self.row_size)
         if bucket not in self.rows:
             self.rows[bucket] = [0.0, 0.0]
         if is_buyer_maker:
-            # Buyer is maker -> Market Sell hit the Bid
             self.rows[bucket][0] += qty
+            self.delta -= qty
         else:
-            # Seller is maker -> Market Buy lifted the Ask
             self.rows[bucket][1] += qty
             self.taker_buy_vol += qty
+            self.delta += qty
 
         self.has_footprint = True
+        self._dirty = True
         if self.open <= 0:
             self.open = price
         if self.high <= 0 or price > self.high:
@@ -79,9 +92,31 @@ class FootprintCandle:
         self.volume += qty
         self.quote_volume += price * qty
 
+    def add_backfill_trade(self, price: float, qty: float, is_buyer_maker: bool, agg_id: int) -> None:
+        if self.min_agg_id is not None and self.max_agg_id is not None:
+            if self.min_agg_id <= agg_id <= self.max_agg_id:
+                return
+        if self.min_agg_id is None or agg_id < self.min_agg_id:
+            self.min_agg_id = agg_id
+        if self.max_agg_id is None or agg_id > self.max_agg_id:
+            self.max_agg_id = agg_id
+
+        if self.row_size <= 0:
+            self.row_size = compute_row_size(self.symbol, price, self.tf)
+        bucket = snap_bucket(price, self.row_size)
+        if bucket not in self.rows:
+            self.rows[bucket] = [0.0, 0.0]
+        if is_buyer_maker:
+            self.rows[bucket][0] += qty
+        else:
+            self.rows[bucket][1] += qty
+
+        self.has_footprint = True
+        self._dirty = True
+
     def compute_metrics(self, imbalance_ratio: float = 3.0, stacked_min: int = 3) -> None:
+        self._dirty = False
         if not self.has_footprint or not self.rows:
-            # Fallback from Binance kline taker_buy_vol for historical candles
             self.delta = round(2.0 * self.taker_buy_vol - self.volume, 6)
             self.poc_price = round((self.high + self.low + self.close) / 3.0, 8)
             return
@@ -89,7 +124,7 @@ class FootprintCandle:
         sorted_prices = sorted(self.rows.keys())
         total_bid = 0.0
         total_ask = 0.0
-        row_totals: List[Tuple[float, float, float, float]] = []  # (p, bid, ask, tot)
+        row_totals: List[Tuple[float, float, float, float]] = []
 
         max_vol = -1.0
         poc_idx = 0
@@ -103,19 +138,21 @@ class FootprintCandle:
                 max_vol = tot
                 poc_idx = idx
 
-        self.delta = round(total_ask - total_bid, 6)
+        # Only override delta with row sum if rows span the candle meaningfully; otherwise keep kline delta
+        row_total_vol = total_bid + total_ask
+        if self.volume <= 0 or row_total_vol >= self.volume * 0.55:
+            self.delta = round(total_ask - total_bid, 6)
+        else:
+            self.delta = round(2.0 * self.taker_buy_vol - self.volume, 6)
+
         self.poc_price = row_totals[poc_idx][0]
         self.poc_vol = round(max_vol, 6)
+        avg_row_vol = (row_total_vol / len(row_totals)) if row_totals else 0.0
 
-        total_row_vol = total_bid + total_ask
-        avg_row_vol = (total_row_vol / len(row_totals)) if row_totals else 0.0
-
-        # 70% Value Area around POC
-        if total_row_vol > 0 and len(row_totals) > 0:
-            target_va = total_row_vol * 0.70
+        if row_total_vol > 0 and len(row_totals) > 0:
+            target_va = row_total_vol * 0.70
             va_vol = row_totals[poc_idx][3]
-            lo = poc_idx
-            hi = poc_idx
+            lo, hi = poc_idx, poc_idx
             while va_vol < target_va and (lo > 0 or hi < len(row_totals) - 1):
                 down_vol = row_totals[lo - 1][3] if lo > 0 else -1.0
                 up_vol = row_totals[hi + 1][3] if hi < len(row_totals) - 1 else -1.0
@@ -133,7 +170,6 @@ class FootprintCandle:
             self.val_price = self.low
             self.vah_price = self.high
 
-        # Unfinished Auction check at extreme rows (both bid and ask traded significantly)
         if row_totals:
             lo_bid, lo_ask = row_totals[0][1], row_totals[0][2]
             hi_bid, hi_ask = row_totals[-1][1], row_totals[-1][2]
@@ -141,14 +177,12 @@ class FootprintCandle:
             self.unfinished_low = lo_bid > min_edge_vol and lo_ask > min_edge_vol
             self.unfinished_high = hi_bid > min_edge_vol and hi_ask > min_edge_vol
 
-        # Diagonal Imbalances (Ask[i] vs Bid[i-1] for Buy; Bid[i] vs Ask[i+1] for Sell)
         buy_imbs: List[float] = []
         sell_imbs: List[float] = []
         min_imb_vol = avg_row_vol * 0.35
 
         for i in range(len(row_totals)):
             p, bid_i, ask_i, _ = row_totals[i]
-            # Buy imbalance: Ask at row i vs Bid at row i-1 (contiguous row check)
             if i > 0 and abs((p - row_totals[i - 1][0]) - self.row_size) <= self.row_size * 0.15:
                 bid_below = row_totals[i - 1][1]
                 if ask_i >= min_imb_vol:
@@ -157,7 +191,6 @@ class FootprintCandle:
                     ):
                         buy_imbs.append(p)
 
-            # Sell imbalance: Bid at row i vs Ask at row i+1 (contiguous row check)
             if i < len(row_totals) - 1 and abs((row_totals[i + 1][0] - p) - self.row_size) <= self.row_size * 0.15:
                 ask_above = row_totals[i + 1][2]
                 if bid_i >= min_imb_vol:
@@ -169,13 +202,11 @@ class FootprintCandle:
         self.buy_imbalances = buy_imbs
         self.sell_imbalances = sell_imbs
 
-        # Stacked Imbalances (3+ contiguous imbalanced rows)
         stacked: List[Dict[str, Any]] = []
         stacked.extend(self._find_stacked(buy_imbs, "BULL", stacked_min))
         stacked.extend(self._find_stacked(sell_imbs, "BEAR", stacked_min))
         self.stacked_zones = stacked
 
-        # Absorption & Trapped Traders detection
         self.absorption = None
         self.absorption_price = None
         self.trapped = None
@@ -190,41 +221,36 @@ class FootprintCandle:
         top_threshold = self.high - candle_range * 0.35
         bot_threshold = self.low + candle_range * 0.35
 
-        # Bearish Absorption at Top Wick (Heavy Ask buying absorbed -> rejected lower)
-        if upper_wick_ratio >= 0.30 and total_row_vol > 0:
+        if upper_wick_ratio >= 0.30 and row_total_vol > 0:
             top_ask_vol = sum(r[2] for r in row_totals if r[0] >= top_threshold)
             top_bid_vol = sum(r[1] for r in row_totals if r[0] >= top_threshold)
-            top_tot = top_ask_vol + top_bid_vol
-            if top_tot >= total_row_vol * 0.25 and (top_ask_vol > top_bid_vol * 1.15 or self.close < self.open):
+            if (top_ask_vol + top_bid_vol) >= row_total_vol * 0.25 and (
+                top_ask_vol > top_bid_vol * 1.15 or self.close < self.open
+            ):
                 self.absorption = "BEAR"
                 max_top_row = max((r for r in row_totals if r[0] >= top_threshold), key=lambda x: x[3], default=None)
                 self.absorption_price = max_top_row[0] if max_top_row else self.high
-
-                # Trapped Longs: Buy imbalances OR POC trapped inside the upper wick above close
                 trapped_asks = [p for p in buy_imbs if p > max(self.open, self.close)]
                 if trapped_asks or (self.poc_price > max(self.open, self.close) and self.close <= self.open):
                     self.trapped = "TRAPPED_LONGS"
                     z_low = min(trapped_asks) if trapped_asks else max(self.open, self.close)
                     self.trapped_zone = (round(z_low, 8), round(self.high, 8))
 
-        # Bullish Absorption at Bottom Wick (Heavy Bid selling absorbed -> rejected higher)
-        if lower_wick_ratio >= 0.30 and total_row_vol > 0 and self.absorption is None:
+        if lower_wick_ratio >= 0.30 and row_total_vol > 0 and self.absorption is None:
             bot_bid_vol = sum(r[1] for r in row_totals if r[0] <= bot_threshold)
             bot_ask_vol = sum(r[2] for r in row_totals if r[0] <= bot_threshold)
-            bot_tot = bot_bid_vol + bot_ask_vol
-            if bot_tot >= total_row_vol * 0.25 and (bot_bid_vol > bot_ask_vol * 1.15 or self.close > self.open):
+            if (bot_bid_vol + bot_ask_vol) >= row_total_vol * 0.25 and (
+                bot_bid_vol > bot_ask_vol * 1.15 or self.close > self.open
+            ):
                 self.absorption = "BULL"
                 max_bot_row = max((r for r in row_totals if r[0] <= bot_threshold), key=lambda x: x[3], default=None)
                 self.absorption_price = max_bot_row[0] if max_bot_row else self.low
-
-                # Trapped Shorts: Sell imbalances OR POC trapped inside the lower wick below close
                 trapped_bids = [p for p in sell_imbs if p < min(self.open, self.close)]
                 if trapped_bids or (self.poc_price < min(self.open, self.close) and self.close >= self.open):
                     self.trapped = "TRAPPED_SHORTS"
                     z_high = max(trapped_bids) + self.row_size if trapped_bids else min(self.open, self.close)
                     self.trapped_zone = (round(self.low, 8), round(z_high, 8))
 
-        # Single-bar Delta Divergence
         self.divergence = None
         if self.close > self.open and self.delta < -avg_row_vol * 0.5:
             self.divergence = "BEAR_DIV"
@@ -316,21 +342,25 @@ class SymbolOrderflowState:
         self.open_interest: float = 0.0
         self.oi_history: Deque[Tuple[int, float]] = deque(maxlen=120)
 
-        # Live L2 Orderbook snapshot (top 20 bids/asks)
+        # Live L2 Orderbook & Grouped Institutional Walls
         self.bids: List[Tuple[float, float]] = []
         self.asks: List[Tuple[float, float]] = []
         self.bid_walls: List[Dict[str, float]] = []
         self.ask_walls: List[Dict[str, float]] = []
         self.ob_imbalance_pct: float = 0.0
         self.last_depth_ts: int = 0
+        self.has_deep_walls: bool = False
 
-        # Recent liquidations buffer
         self.recent_liqs: Deque[Dict[str, Any]] = deque(maxlen=60)
-
-        # Engine status badge for dashboard
-        self.scanner_state: str = "SCANNING"      # SCANNING | AT_LEVEL | SWEEP_DETECTED | ACTIVE_SIGNAL
+        self.scanner_state: str = "SCANNING"
         self.scanner_note: str = "Monitoring structure & liquidity pools"
         self.active_bias: str = "NEUTRAL"
+        self.min_seen_agg_id: Optional[int] = None
+        self.backfilled_pages: int = 0
+
+        # Cached liquidity map
+        self._cached_lmap: Dict[str, Any] = {}
+        self._cached_lmap_ts: float = 0.0
 
     def load_historical_klines(self, tf: str, raw_klines: List[List[Any]]) -> None:
         with self.lock:
@@ -373,7 +403,7 @@ class SymbolOrderflowState:
                 new_list.append(candle)
 
             self.candles[tf] = new_list[-self.max_candles:]
-            if new_list:
+            if new_list and self.last_price <= 0:
                 self.last_price = new_list[-1].close
 
     def process_agg_trade(
@@ -382,11 +412,17 @@ class SymbolOrderflowState:
         qty: float,
         is_buyer_maker: bool,
         ts_ms: int,
+        agg_id: Optional[int] = None,
         imbalance_ratio: float = 3.0,
         stacked_min: int = 3,
+        recompute: bool = False,
     ) -> None:
         with self.lock:
             self.last_price = price
+            if agg_id is not None:
+                if self.min_seen_agg_id is None or agg_id < self.min_seen_agg_id:
+                    self.min_seen_agg_id = agg_id
+
             for tf in ("1m", "5m", "15m", "1h"):
                 bars = self.candles[tf]
                 tf_ms = self._tf_to_ms(tf)
@@ -395,18 +431,10 @@ class SymbolOrderflowState:
 
                 if not bars:
                     rs = compute_row_size(self.symbol, price, tf)
-                    c = FootprintCandle(
-                        symbol=self.symbol,
-                        tf=tf,
-                        open_time=bar_open,
-                        close_time=bar_close,
-                        open=price,
-                        high=price,
-                        low=price,
-                        close=price,
-                        row_size=rs,
-                    )
-                    bars.append(c)
+                    bars.append(FootprintCandle(
+                        symbol=self.symbol, tf=tf, open_time=bar_open, close_time=bar_close,
+                        open=price, high=price, low=price, close=price, row_size=rs,
+                    ))
 
                 last = bars[-1]
                 if bar_open > last.open_time:
@@ -415,16 +443,8 @@ class SymbolOrderflowState:
                     prev_cvd = last.cvd
                     rs = compute_row_size(self.symbol, price, tf)
                     c = FootprintCandle(
-                        symbol=self.symbol,
-                        tf=tf,
-                        open_time=bar_open,
-                        close_time=bar_close,
-                        open=price,
-                        high=price,
-                        low=price,
-                        close=price,
-                        row_size=rs,
-                        cvd=prev_cvd,
+                        symbol=self.symbol, tf=tf, open_time=bar_open, close_time=bar_close,
+                        open=price, high=price, low=price, close=price, row_size=rs, cvd=prev_cvd,
                     )
                     bars.append(c)
                     if len(bars) > self.max_candles:
@@ -432,10 +452,63 @@ class SymbolOrderflowState:
                     last = c
 
                 if bar_open == last.open_time:
-                    last.add_trade(price, qty, is_buyer_maker)
-                    last.compute_metrics(imbalance_ratio, stacked_min)
+                    last.add_trade(price, qty, is_buyer_maker, agg_id=agg_id)
+                    if recompute:
+                        last.compute_metrics(imbalance_ratio, stacked_min)
                     prev_bar_cvd = bars[-2].cvd if len(bars) >= 2 else 0.0
                     last.cvd = round(prev_bar_cvd + last.delta, 6)
+
+    def apply_backfill_trades(
+        self, trades: List[Dict[str, Any]], imbalance_ratio: float = 3.0, stacked_min: int = 3
+    ) -> None:
+        if not trades:
+            return
+        with self.lock:
+            touched_bars = set()
+            for tr in trades:
+                agg_id = int(tr["a"])
+                px = float(tr["p"])
+                qty = float(tr["q"])
+                is_bm = bool(tr["m"])
+                ts_ms = int(tr["T"])
+
+                if self.min_seen_agg_id is None or agg_id < self.min_seen_agg_id:
+                    self.min_seen_agg_id = agg_id
+
+                for tf in ("1m", "5m", "15m", "1h"):
+                    bars = self.candles[tf]
+                    if not bars:
+                        continue
+                    tf_ms = self._tf_to_ms(tf)
+                    bar_open = (ts_ms // tf_ms) * tf_ms
+                    # Binary/reverse scan for matching bar
+                    for b in reversed(bars):
+                        if b.open_time == bar_open:
+                            b.add_backfill_trade(px, qty, is_bm, agg_id)
+                            touched_bars.add((tf, b.open_time))
+                            break
+                        if b.open_time < bar_open:
+                            break
+
+            for tf in ("1m", "5m", "15m", "1h"):
+                bars = self.candles[tf]
+                cvd = 0.0
+                for b in bars:
+                    if (tf, b.open_time) in touched_bars or b._dirty:
+                        b.compute_metrics(imbalance_ratio, stacked_min)
+                    cvd += b.delta
+                    b.cvd = round(cvd, 6)
+
+    def ensure_metrics_fresh(self, tf: str, imbalance_ratio: float = 3.0, stacked_min: int = 3) -> None:
+        with self.lock:
+            bars = self.candles.get(tf, [])
+            if not bars:
+                return
+            last = bars[-1]
+            if last._dirty:
+                last.compute_metrics(imbalance_ratio, stacked_min)
+                prev_cvd = bars[-2].cvd if len(bars) >= 2 else 0.0
+                last.cvd = round(prev_cvd + last.delta, 6)
 
     def process_kline_ws(
         self,
@@ -456,23 +529,18 @@ class SymbolOrderflowState:
             taker_buy = float(k["V"])
             is_closed = bool(k["x"])
 
+            self.last_price = c_px
             target: Optional[FootprintCandle] = None
             if bars and bars[-1].open_time == open_t:
                 target = bars[-1]
             elif not bars or open_t > bars[-1].open_time:
                 if bars:
                     bars[-1].is_closed = True
+                    bars[-1].compute_metrics(imbalance_ratio, stacked_min)
                 rs = compute_row_size(self.symbol, c_px, tf)
                 target = FootprintCandle(
-                    symbol=self.symbol,
-                    tf=tf,
-                    open_time=open_t,
-                    close_time=close_t,
-                    open=o,
-                    high=h,
-                    low=l,
-                    close=c_px,
-                    row_size=rs,
+                    symbol=self.symbol, tf=tf, open_time=open_t, close_time=close_t,
+                    open=o, high=h, low=l, close=c_px, row_size=rs,
                 )
                 bars.append(target)
                 if len(bars) > self.max_candles:
@@ -487,44 +555,98 @@ class SymbolOrderflowState:
                 target.volume = vol
                 target.quote_volume = q_vol
                 target.taker_buy_vol = taker_buy
-            target.compute_metrics(imbalance_ratio, stacked_min)
+            if is_closed or target._dirty or not target.has_footprint:
+                target.compute_metrics(imbalance_ratio, stacked_min)
             prev_cvd = bars[-2].cvd if len(bars) >= 2 else 0.0
             target.cvd = round(prev_cvd + target.delta, 6)
             return target if is_closed else None
 
     def process_depth(self, bids_raw: List[List[str]], asks_raw: List[List[str]], ts_ms: int) -> None:
         with self.lock:
-            bids = [(float(p), float(q)) for p, q in bids_raw if float(q) > 0]
-            asks = [(float(p), float(q)) for p, q in asks_raw if float(q) > 0]
-            self.bids = bids
-            self.asks = asks
+            bids_all = [(float(p), float(q)) for p, q in bids_raw if float(q) > 0]
+            asks_all = [(float(p), float(q)) for p, q in asks_raw if float(q) > 0]
+            if not bids_all or not asks_all:
+                return
+
+            ref_px = self.last_price or bids_all[0][0]
+            rs = compute_row_size(self.symbol, ref_px, "5m")
+
+            # Group raw ticks into clean row_size levels for readable Orderbook UI
+            b_grp: Dict[float, float] = {}
+            for p, q in bids_all:
+                bp = snap_bucket(p, rs)
+                b_grp[bp] = b_grp.get(bp, 0.0) + q
+            a_grp: Dict[float, float] = {}
+            for p, q in asks_all:
+                bp = snap_bucket(p, rs)
+                a_grp[bp] = a_grp.get(bp, 0.0) + q
+
+            self.bids = sorted(b_grp.items(), key=lambda x: x[0], reverse=True)
+            self.asks = sorted(a_grp.items(), key=lambda x: x[0])
             self.last_depth_ts = ts_ms
 
-            bid_usd = sum(p * q for p, q in bids)
-            ask_usd = sum(p * q for p, q in asks)
+            bid_usd = sum(p * q for p, q in bids_all)
+            ask_usd = sum(p * q for p, q in asks_all)
             tot = bid_usd + ask_usd
             self.ob_imbalance_pct = round(((bid_usd - ask_usd) / tot) * 100.0, 2) if tot > 0 else 0.0
 
-            # Detect resting walls (>= 2.5x average level USD depth in top 20)
-            avg_bid = (bid_usd / len(bids)) if bids else 0.0
-            avg_ask = (ask_usd / len(asks)) if asks else 0.0
+            if not self.has_deep_walls:
+                avg_b = (bid_usd / len(self.bids)) if self.bids else 0.0
+                avg_a = (ask_usd / len(self.asks)) if self.asks else 0.0
+                min_usd = 250_000 if self.symbol in ("BTCUSDT", "ETHUSDT") else 40_000
+                self.bid_walls = [
+                    {"price": p, "qty": q, "usd": round(p * q, 2)}
+                    for p, q in self.bids
+                    if (p * q) >= max(avg_b * 2.5, min_usd)
+                ]
+                self.ask_walls = [
+                    {"price": p, "qty": q, "usd": round(p * q, 2)}
+                    for p, q in self.asks
+                    if (p * q) >= max(avg_a * 2.5, min_usd)
+                ]
 
+    def process_deep_orderbook(self, bids_raw: List[List[str]], asks_raw: List[List[str]]) -> None:
+        """Aggregates 500-level REST depth by 15m row_size to locate real institutional Bid/Ask walls."""
+        with self.lock:
+            bids_all = [(float(p), float(q)) for p, q in bids_raw if float(q) > 0]
+            asks_all = [(float(p), float(q)) for p, q in asks_raw if float(q) > 0]
+            if not bids_all or not asks_all:
+                return
+            ref_px = self.last_price or bids_all[0][0]
+            rs = compute_row_size(self.symbol, ref_px, "15m")
+
+            b_grp: Dict[float, float] = {}
+            for p, q in bids_all:
+                bp = snap_bucket(p, rs)
+                b_grp[bp] = b_grp.get(bp, 0.0) + q
+            a_grp: Dict[float, float] = {}
+            for p, q in asks_all:
+                bp = snap_bucket(p, rs)
+                a_grp[bp] = a_grp.get(bp, 0.0) + q
+
+            b_usd_list = [(p, q, p * q) for p, q in b_grp.items()]
+            a_usd_list = [(p, q, p * q) for p, q in a_grp.items()]
+            avg_b = sum(x[2] for x in b_usd_list) / max(1, len(b_usd_list))
+            avg_a = sum(x[2] for x in a_usd_list) / max(1, len(a_usd_list))
+
+            min_wall_usd = 750_000 if self.symbol == "BTCUSDT" else (300_000 if self.symbol == "ETHUSDT" else 80_000)
             self.bid_walls = [
-                {"price": p, "qty": q, "usd": round(p * q, 2)}
-                for p, q in bids
-                if avg_bid > 0 and (p * q) >= avg_bid * 2.3
-            ]
+                {"price": p, "qty": round(q, 3), "usd": round(u, 2)}
+                for p, q, u in sorted(b_usd_list, key=lambda x: x[2], reverse=True)
+                if u >= max(avg_b * 2.6, min_wall_usd)
+            ][:4]
             self.ask_walls = [
-                {"price": p, "qty": q, "usd": round(p * q, 2)}
-                for p, q in asks
-                if avg_ask > 0 and (p * q) >= avg_ask * 2.3
-            ]
+                {"price": p, "qty": round(q, 3), "usd": round(u, 2)}
+                for p, q, u in sorted(a_usd_list, key=lambda x: x[2], reverse=True)
+                if u >= max(avg_a * 2.6, min_wall_usd)
+            ][:4]
+            self.has_deep_walls = True
 
     def process_liquidation(self, side: str, price: float, qty: float, ts_ms: int) -> None:
         with self.lock:
             usd = price * qty
             self.recent_liqs.append({
-                "side": side,  # "BUY" = short liquidated, "SELL" = long liquidated
+                "side": side,
                 "price": price,
                 "qty": qty,
                 "usd": round(usd, 2),
@@ -549,7 +671,6 @@ class SymbolOrderflowState:
             if len(bars) < 3:
                 return []
             npocs: List[Dict[str, Any]] = []
-            # Only closed bars with footprint data produce high-precision nPOCs
             for i in range(len(bars) - 2):
                 c = bars[i]
                 if not c.is_closed or not c.has_footprint or c.poc_price <= 0:
@@ -591,7 +712,7 @@ class SymbolOrderflowState:
             if not bars:
                 return {"poc": 0.0, "vah": 0.0, "val": 0.0, "bins": []}
             rs = compute_row_size(self.symbol, bars[-1].close, tf)
-            profile: Dict[float, List[float]] = {}  # bucket -> [bid, ask]
+            profile: Dict[float, List[float]] = {}
 
             for c in bars:
                 if c.has_footprint and c.rows:
@@ -602,7 +723,6 @@ class SymbolOrderflowState:
                         profile[bp][0] += b
                         profile[bp][1] += a
                 else:
-                    # Distribute historical bar volume across [low, high] cleanly
                     lo_b = snap_bucket(c.low, rs)
                     hi_b = snap_bucket(c.high, rs)
                     n_steps = max(1, int(round((hi_b - lo_b) / rs)) + 1)
