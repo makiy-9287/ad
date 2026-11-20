@@ -11,7 +11,7 @@
     <div class="brand">
       <span class="pulse-dot" id="conn-dot"></span>
       <span class="brand-title">ORDERFLOW<span class="accent">X</span></span>
-      <span class="brand-sub">Binance Perp · Liquidity & Footprint</span>
+      <span class="brand-sub">Binance Perp · Liquidity &amp; Footprint</span>
     </div>
 
     <div class="top-stats" id="top-stats">
@@ -21,18 +21,17 @@
     </div>
 
     <nav class="nav-tabs">
-      <button class="nav-btn active" data-view="terminal">Terminal & Chart</button>
+      <button class="nav-btn active" data-view="terminal">Terminal &amp; Chart</button>
       <button class="nav-btn" data-view="signals">Signals History</button>
-      <button class="nav-btn" data-view="settings">Settings & Telegram</button>
+      <button class="nav-btn" data-view="settings">Settings &amp; Telegram</button>
     </nav>
   </header>
 
-  <!-- VIEW 1: TERMINAL & FOOTPRINT CHART -->
   <main id="view-terminal" class="view active">
     <aside class="sidebar">
       <div class="panel-header">
         <span>10-COIN SCANNER</span>
-        <span class="badge-live">LIVE</span>
+        <span class="badge-live" id="live-clock">LIVE 1s</span>
       </div>
       <div id="watchlist-container" class="watchlist"></div>
     </aside>
@@ -52,27 +51,27 @@
           <button class="tf-btn active" data-tf="5m">5m</button>
           <button class="tf-btn" data-tf="15m">15m</button>
           <button class="tf-btn" data-tf="1h">1h</button>
-          <button class="tf-btn" id="btn-reset-zoom" title="Double-click chart to reset">Reset Zoom</button>
+          <button class="tf-btn" id="btn-fp-zoom" title="Zoom in to see Bid x Ask Footprint numbers">FP View</button>
+          <button class="tf-btn" id="btn-reset-zoom" title="Double-click chart to reset">Overview</button>
         </div>
       </div>
 
       <div class="bar-info" id="bar-info">
-        Hover or scroll to zoom in for Bid × Ask Footprint cells · Drag to pan
+        Click "FP View" or scroll to zoom in for Bid × Ask Footprint cells · Drag to pan
       </div>
 
       <div class="canvas-wrap">
         <canvas id="fp-canvas"></canvas>
       </div>
 
-      <!-- Active Signal Card Banner below chart -->
       <div class="active-signal-bar" id="active-signal-bar">
-        <span class="muted">No active signal on this coin right now. Engine is monitoring liquidity pools & orderflow confirmations.</span>
+        <span class="muted">No active signal on this coin right now. Engine is monitoring liquidity pools &amp; orderflow confirmations.</span>
       </div>
     </section>
 
     <aside class="right-panel">
       <div class="panel-header">
-        <span>ORDERBOOK & LIQUIDITY</span>
+        <span>ORDERBOOK &amp; LIQUIDITY</span>
         <span id="ob-imb" class="ob-imb">0%</span>
       </div>
 
@@ -82,7 +81,7 @@
       </div>
 
       <div class="sub-card ob-card">
-        <div class="sub-title">Live Orderbook Depth (Walls Highlighted)</div>
+        <div class="sub-title">Grouped Orderbook (Major Walls Highlighted)</div>
         <div class="ob-book">
           <div id="ob-asks" class="ob-side"></div>
           <div class="ob-spread" id="ob-spread">--</div>
@@ -92,11 +91,10 @@
     </aside>
   </main>
 
-  <!-- VIEW 2: SIGNALS HISTORY -->
   <section id="view-signals" class="view view-padded">
     <div class="card">
       <div class="card-head">
-        <h3>Confirmed Signals & Live Auto-Tracker</h3>
+        <h3>Confirmed Signals &amp; Live Auto-Tracker</h3>
         <button class="btn-secondary" id="btn-refresh-signals">Refresh</button>
       </div>
       <div class="table-wrap">
@@ -124,7 +122,6 @@
     </div>
   </section>
 
-  <!-- VIEW 3: SETTINGS & TELEGRAM -->
   <section id="view-settings" class="view view-padded">
     <div class="settings-grid">
       <div class="card">
