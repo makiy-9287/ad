@@ -5,8 +5,8 @@ class FootprintChart {
     this.infoEl = infoEl;
 
     this.data = null;
-    this.visibleCount = 46;
-    this.rightOffset = 8; // blank bars on right for profile & labels
+    this.visibleCount = 24; // Default medium zoom so Footprint bars & structure are both clear
+    this.rightOffset = 5;
     this.panIndexOffset = 0;
 
     this.mouseX = null;
@@ -24,8 +24,8 @@ class FootprintChart {
 
     this.canvas.addEventListener("wheel", (e) => {
       e.preventDefault();
-      const delta = e.deltaY > 0 ? 4 : -4;
-      this.visibleCount = Math.max(10, Math.min(110, this.visibleCount + delta));
+      const delta = e.deltaY > 0 ? 3 : -3;
+      this.visibleCount = Math.max(8, Math.min(110, this.visibleCount + delta));
       this.draw();
     }, { passive: false });
 
@@ -44,7 +44,7 @@ class FootprintChart {
       if (this.isDragging && this.data) {
         const pxPerBar = Math.max(4, (rect.width - 90) / this.visibleCount);
         const shiftBars = Math.round((e.clientX - this.dragStartX) / pxPerBar);
-        const maxPan = Math.max(0, (this.data.candles?.length || 0) - 10);
+        const maxPan = Math.max(0, (this.data.candles?.length || 0) - 8);
         this.panIndexOffset = Math.max(0, Math.min(maxPan, this.dragStartPan + shiftBars));
       }
       this.draw();
@@ -57,6 +57,12 @@ class FootprintChart {
     });
 
     this.canvas.addEventListener("dblclick", () => this.resetView());
+  }
+
+  setFootprintZoom() {
+    this.visibleCount = 14;
+    this.panIndexOffset = 0;
+    this.draw();
   }
 
   resetView() {
@@ -73,13 +79,18 @@ class FootprintChart {
     if (payload.full || !this.data || this.data.symbol !== payload.symbol || this.data.tf !== payload.tf) {
       this.data = payload;
     } else {
-      // Merge partial candle updates cleanly
       const map = new Map((this.data.candles || []).map((c) => [c.t, c]));
       for (const c of payload.candles || []) {
         map.set(c.t, c);
       }
       const merged = Array.from(map.values()).sort((a, b) => a.t - b.t).slice(-120);
-      this.data = { ...payload, candles: merged };
+      this.data = {
+        ...this.data,
+        ...payload,
+        vp: payload.vp || this.data.vp,
+        npocs: payload.npocs || this.data.npocs,
+        candles: merged,
+      };
     }
     this.draw();
   }
@@ -111,6 +122,13 @@ class FootprintChart {
     return v.toFixed(2);
   }
 
+  fmtCountdown(closeTime) {
+    const diff = Math.max(0, Math.floor((closeTime - Date.now()) / 1000));
+    const m = Math.floor(diff / 60);
+    const s = diff % 60;
+    return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  }
+
   draw() {
     const ctx = this.ctx;
     const dpr = window.devicePixelRatio || 1;
@@ -133,13 +151,14 @@ class FootprintChart {
     const totalBars = candlesAll.length;
     const endIdx = Math.max(1, totalBars - this.panIndexOffset);
     const drawSlots = this.visibleCount;
-    const candleSlots = Math.max(5, drawSlots - (this.panIndexOffset === 0 ? this.rightOffset : 0));
+    const rightGap = this.panIndexOffset === 0 ? Math.min(this.rightOffset, Math.floor(drawSlots * 0.25)) : 0;
+    const candleSlots = Math.max(4, drawSlots - rightGap);
     const startIdx = Math.max(0, endIdx - candleSlots);
     const bars = candlesAll.slice(startIdx, endIdx);
     if (!bars.length) return;
 
-    const rightAxisW = 78;
-    const vpWidth = 72;
+    const rightAxisW = 82;
+    const vpWidth = 68;
     const plotW = W - rightAxisW;
     const mainH = Math.floor(H * 0.72);
     const volH = Math.floor(H * 0.09);
@@ -147,30 +166,33 @@ class FootprintChart {
     const cvdH = H - mainH - volH - deltaH - 22;
 
     const barStep = plotW / drawSlots;
-    const barW = Math.max(3, barStep * 0.78);
-    const showFootprintText = barStep >= 54;
+    const barW = Math.max(4, barStep * 0.80);
+    const showFootprintText = barStep >= 42;
 
-    // Price bounds
     let pMin = Infinity;
     let pMax = -Infinity;
     for (const b of bars) {
       if (b.l < pMin) pMin = b.l;
       if (b.h > pMax) pMax = b.h;
     }
-    // Include active signals within reasonable range
+    const lastPx = this.data.last_price || bars[bars.length - 1].c;
+    if (lastPx > 0) {
+      pMin = Math.min(pMin, lastPx);
+      pMax = Math.max(pMax, lastPx);
+    }
     for (const s of this.data.active_signals || []) {
       pMin = Math.min(pMin, s.stop_loss, s.tp2);
       pMax = Math.max(pMax, s.stop_loss, s.tp2);
     }
-    const pad = Math.max((pMax - pMin) * 0.12, pMax * 0.001);
+    const pad = Math.max((pMax - pMin) * 0.12, pMax * 0.0008);
     pMin -= pad;
     pMax += pad;
 
     const yOf = (px) => 12 + ((pMax - px) / (pMax - pMin)) * (mainH - 24);
     const pxOf = (y) => pMax - ((y - 12) / (mainH - 24)) * (pMax - pMin);
 
-    // Grid lines & Price Axis
-    ctx.strokeStyle = "rgba(35, 42, 59, 0.55)";
+    // Grid & Price Axis
+    ctx.strokeStyle = "rgba(35, 42, 59, 0.5)";
     ctx.lineWidth = 1;
     ctx.font = "11px monospace";
     ctx.fillStyle = "#8b95a7";
@@ -179,14 +201,11 @@ class FootprintChart {
     for (let i = 0; i <= gridRows; i++) {
       const px = pMin + ((pMax - pMin) * i) / gridRows;
       const y = yOf(px);
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(plotW, y);
-      ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
       ctx.fillText(this.fmtPx(px), plotW + 6, y + 4);
     }
 
-    // Visible Volume Profile on right edge of plotW
+    // Visible Volume Profile on right
     const vp = this.data.vp;
     if (vp && vp.bins && vp.bins.length) {
       const maxBinVol = Math.max(...vp.bins.map((b) => b.t), 1e-9);
@@ -197,16 +216,15 @@ class FootprintChart {
         const h = Math.max(1.5, yBot - yTop - 1);
         const w = (bin.t / maxBinVol) * vpWidth;
         const isPoc = Math.abs(bin.p - vp.poc) < (vp.rs || 1) * 0.2;
-        ctx.fillStyle = isPoc ? "rgba(245, 183, 0, 0.55)" : "rgba(59, 130, 246, 0.25)";
+        ctx.fillStyle = isPoc ? "rgba(245, 183, 0, 0.55)" : "rgba(59, 130, 246, 0.22)";
         ctx.fillRect(plotW - w, yTop, w, h);
       }
-      // VAH / VAL dashed lines
-      for (const [lvl, lbl, col] of [[vp.vah, "VAH", "rgba(139,149,167,0.5)"], [vp.val, "VAL", "rgba(139,149,167,0.5)"]]) {
+      for (const [lvl, lbl] of [[vp.vah, "VAH"], [vp.val, "VAL"]]) {
         if (lvl > pMin && lvl < pMax) {
           const y = yOf(lvl);
           ctx.save();
           ctx.setLineDash([4, 4]);
-          ctx.strokeStyle = col;
+          ctx.strokeStyle = "rgba(139,149,167,0.4)";
           ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
           ctx.restore();
           ctx.fillStyle = "#8b95a7";
@@ -215,49 +233,66 @@ class FootprintChart {
       }
     }
 
-    // Daily VWAP
+    // Clean Non-overlapping Liquidity Labels on right-inner edge (top 3 BSL & top 3 SSL + VWAP)
+    const usedLabelYs = [];
+    const canPlaceLabel = (y) => {
+      for (const uy of usedLabelYs) {
+        if (Math.abs(uy - y) < 14) return false;
+      }
+      usedLabelYs.push(y);
+      return true;
+    };
+
     if (this.data.vwap && this.data.vwap > pMin && this.data.vwap < pMax) {
       const y = yOf(this.data.vwap);
       ctx.strokeStyle = "rgba(245, 183, 0, 0.7)";
       ctx.lineWidth = 1.3;
       ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
-      ctx.fillStyle = "#f5b700";
-      ctx.fillText("VWAP", 6, y - 4);
+      if (canPlaceLabel(y)) {
+        ctx.fillStyle = "#f5b700";
+        ctx.fillText("VWAP", 8, y - 3);
+      }
     }
 
-    // Naked POCs
-    for (const np of this.data.npocs || []) {
+    for (const np of (this.data.npocs || []).slice(-3)) {
       if (np.price > pMin && np.price < pMax) {
         const y = yOf(np.price);
         ctx.save();
         ctx.setLineDash([3, 3]);
-        ctx.strokeStyle = "rgba(34, 211, 238, 0.65)";
+        ctx.strokeStyle = "rgba(34, 211, 238, 0.55)";
         ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
         ctx.restore();
-        ctx.fillStyle = "#22d3ee";
-        ctx.fillText(`nPOC`, 6, y - 3);
+        if (canPlaceLabel(y)) {
+          ctx.fillStyle = "#22d3ee";
+          ctx.fillText("nPOC", 8, y - 3);
+        }
       }
     }
 
-    // Liquidity Pools (BSL & SSL + Ask/Bid Walls)
     const drawPool = (p, color) => {
-      if (p.price < pMin || p.price > pMax || p.strength < 3) return;
+      if (p.price < pMin || p.price > pMax) return;
       const y = yOf(p.price);
       ctx.save();
       ctx.setLineDash([5, 4]);
       ctx.strokeStyle = color;
-      ctx.lineWidth = p.strength >= 4 ? 1.4 : 1.0;
+      ctx.lineWidth = p.strength >= 4 ? 1.3 : 0.9;
       ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(plotW, y); ctx.stroke();
       ctx.restore();
-      ctx.fillStyle = color;
-      ctx.fillText(`${p.name} ${p.meta ? "(" + p.meta + ")" : ""}`, 8, y - 3);
+      if (canPlaceLabel(y)) {
+        ctx.fillStyle = color;
+        ctx.fillText(`${p.name}${p.meta && p.tf === "OB" ? " (" + p.meta + ")" : ""}`, 8, y - 3);
+      }
     };
-    for (const p of this.data.bsl || []) drawPool(p, "rgba(234, 57, 67, 0.65)");
-    for (const p of this.data.ssl || []) drawPool(p, "rgba(22, 199, 132, 0.65)");
+    for (const p of (this.data.bsl || []).filter((x) => x.strength >= 3).slice(0, 3)) {
+      drawPool(p, "rgba(234, 57, 67, 0.65)");
+    }
+    for (const p of (this.data.ssl || []).filter((x) => x.strength >= 3).slice(0, 3)) {
+      drawPool(p, "rgba(22, 199, 132, 0.65)");
+    }
 
-    // Active Signal Position Boxes (Entry, SL, TP1, TP2)
+    // Active Signal Position Overlay
     for (const sig of this.data.active_signals || []) {
-      const boxStart = Math.max(0, plotW - barStep * 14);
+      const boxStart = Math.max(0, plotW - barStep * 10);
       const boxW = plotW - boxStart;
       const yEntryMid = yOf(sig.entry_mid);
       const ySL = yOf(sig.stop_loss);
@@ -266,24 +301,21 @@ class FootprintChart {
       const yELo = yOf(sig.entry_low);
       const yEHi = yOf(sig.entry_high);
 
-      // SL Zone (Red)
       ctx.fillStyle = "rgba(234, 57, 67, 0.16)";
       ctx.fillRect(boxStart, Math.min(yEntryMid, ySL), boxW, Math.abs(ySL - yEntryMid));
-      // TP Zone (Green)
       ctx.fillStyle = "rgba(22, 199, 132, 0.14)";
       ctx.fillRect(boxStart, Math.min(yEntryMid, yTP2), boxW, Math.abs(yTP2 - yEntryMid));
-      // Entry Zone Box
       ctx.fillStyle = "rgba(59, 130, 246, 0.30)";
       ctx.fillRect(boxStart, Math.min(yELo, yEHi), boxW, Math.max(3, Math.abs(yELo - yEHi)));
 
       ctx.font = "bold 10px monospace";
       ctx.fillStyle = "#ea3943"; ctx.fillText(`SL ${this.fmtPx(sig.stop_loss)}`, boxStart + 4, ySL - 3);
-      ctx.fillStyle = "#3b82f6"; ctx.fillText(`${sig.direction} ENTRY ${this.fmtPx(sig.entry_mid)}`, boxStart + 4, yEntryMid - 3);
-      ctx.fillStyle = "#f5b700"; ctx.fillText(`TP1(BE) ${this.fmtPx(sig.tp1)}`, boxStart + 4, yTP1 - 3);
+      ctx.fillStyle = "#3b82f6"; ctx.fillText(`${sig.direction} ${this.fmtPx(sig.entry_mid)}`, boxStart + 4, yEntryMid - 3);
+      ctx.fillStyle = "#f5b700"; ctx.fillText(`TP1 ${this.fmtPx(sig.tp1)}`, boxStart + 4, yTP1 - 3);
       ctx.fillStyle = "#16c784"; ctx.fillText(`TP2 ${this.fmtPx(sig.tp2)} (${sig.rr}R)`, boxStart + 4, yTP2 + 11);
     }
 
-    // Draw Candles + Footprint + Stacked Imbalances + Absorption/Trapped
+    // Candles + Footprint cells
     for (let i = 0; i < bars.length; i++) {
       const b = bars[i];
       const cx = (i + 0.5) * barStep;
@@ -291,12 +323,11 @@ class FootprintChart {
       const isBull = b.c >= b.o;
       const col = isBull ? "#16c784" : "#ea3943";
 
-      // Extended Stacked Imbalance boxes
       for (const sz of b.stacked || []) {
         const yTop = yOf(sz.high);
         const yBot = yOf(sz.low);
-        const sCol = sz.direction === "BULL" ? "rgba(22, 199, 132, 0.15)" : "rgba(234, 57, 67, 0.15)";
-        const sBdr = sz.direction === "BULL" ? "rgba(22, 199, 132, 0.7)" : "rgba(234, 57, 67, 0.7)";
+        const sCol = sz.direction === "BULL" ? "rgba(22, 199, 132, 0.14)" : "rgba(234, 57, 67, 0.14)";
+        const sBdr = sz.direction === "BULL" ? "rgba(22, 199, 132, 0.65)" : "rgba(234, 57, 67, 0.65)";
         ctx.fillStyle = sCol;
         ctx.fillRect(xLeft, yTop, plotW - xLeft, Math.max(3, yBot - yTop));
         ctx.save();
@@ -306,16 +337,11 @@ class FootprintChart {
         ctx.restore();
       }
 
-      // Wick
       ctx.strokeStyle = col;
       ctx.lineWidth = 1.4;
-      ctx.beginPath();
-      ctx.moveTo(cx, yOf(b.h));
-      ctx.lineTo(cx, yOf(b.l));
-      ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(cx, yOf(b.h)); ctx.lineTo(cx, yOf(b.l)); ctx.stroke();
 
       if (showFootprintText && b.fp && b.rows && b.rows.length) {
-        // Draw thin candle spine on left + Bid × Ask cells
         const bodyTop = yOf(Math.max(b.o, b.c));
         const bodyBot = yOf(Math.min(b.o, b.c));
         ctx.fillStyle = col;
@@ -325,42 +351,40 @@ class FootprintChart {
         for (const row of b.rows) {
           const yTop = yOf(row.p + rs);
           const yBot = yOf(row.p);
-          const rh = Math.max(10, yBot - yTop - 1);
-          const cellX = xLeft + 6;
-          const cellW = barW - 6;
+          const rh = Math.max(9, yBot - yTop - 1);
+          const cellX = xLeft + 5;
+          const cellW = barW - 5;
 
-          ctx.fillStyle = row.bi ? "rgba(22, 199, 132, 0.25)" : (row.si ? "rgba(234, 57, 67, 0.25)" : "rgba(23, 28, 40, 0.85)");
+          ctx.fillStyle = row.bi ? "rgba(22, 199, 132, 0.25)" : (row.si ? "rgba(234, 57, 67, 0.25)" : "rgba(23, 28, 40, 0.88)");
           ctx.fillRect(cellX, yTop, cellW, rh);
 
           if (row.poc) {
             ctx.strokeStyle = "#f5b700";
-            ctx.lineWidth = 1.4;
+            ctx.lineWidth = 1.3;
             ctx.strokeRect(cellX, yTop, cellW, rh);
           }
 
-          if (rh >= 11) {
-            ctx.font = "9.5px monospace";
+          if (rh >= 10) {
+            ctx.font = barStep >= 62 ? "9.5px monospace" : "8.5px monospace";
             ctx.textAlign = "right";
             ctx.fillStyle = row.si ? "#ff7b82" : "#d0d6e2";
-            ctx.fillText(this.fmtVol(row.b), cellX + cellW * 0.46, yTop + rh * 0.72);
+            ctx.fillText(this.fmtVol(row.b), cellX + cellW * 0.46, yTop + rh * 0.74);
             ctx.textAlign = "left";
             ctx.fillStyle = row.bi ? "#3ee8a5" : "#d0d6e2";
-            ctx.fillText(this.fmtVol(row.a), cellX + cellW * 0.54, yTop + rh * 0.72);
+            ctx.fillText(this.fmtVol(row.a), cellX + cellW * 0.54, yTop + rh * 0.74);
           }
         }
       } else {
-        // Regular Candle Body
         const bodyTop = yOf(Math.max(b.o, b.c));
         const bodyBot = yOf(Math.min(b.o, b.c));
         ctx.fillStyle = col;
         ctx.fillRect(xLeft, bodyTop, barW, Math.max(2, bodyBot - bodyTop));
       }
 
-      // Absorption circle & Trapped label
       if (b.abs && b.abs_p) {
         const ay = yOf(b.abs_p);
         ctx.beginPath();
-        ctx.arc(cx, ay, Math.max(5, Math.min(10, barW * 0.4)), 0, Math.PI * 2);
+        ctx.arc(cx, ay, Math.max(5, Math.min(9, barW * 0.35)), 0, Math.PI * 2);
         ctx.strokeStyle = b.abs === "BULL" ? "#16c784" : "#ea3943";
         ctx.lineWidth = 2;
         ctx.stroke();
@@ -381,24 +405,28 @@ class FootprintChart {
       }
     }
 
-    // Current Price Line + Right Tag
-    const lastPx = this.data.last_price || bars[bars.length - 1].c;
+    // Current Price Line + Right Tag + Countdown Timer
+    const liveBar = bars[bars.length - 1];
     if (lastPx >= pMin && lastPx <= pMax) {
       const ly = yOf(lastPx);
+      const isUp = liveBar.c >= liveBar.o;
       ctx.save();
       ctx.setLineDash([2, 2]);
-      ctx.strokeStyle = "#e4e8f0";
+      ctx.strokeStyle = isUp ? "#16c784" : "#ea3943";
       ctx.beginPath(); ctx.moveTo(0, ly); ctx.lineTo(plotW, ly); ctx.stroke();
       ctx.restore();
-      ctx.fillStyle = "#e4e8f0";
-      ctx.fillRect(plotW + 2, ly - 9, rightAxisW - 4, 18);
+
+      ctx.fillStyle = isUp ? "#16c784" : "#ea3943";
+      ctx.fillRect(plotW + 2, ly - 15, rightAxisW - 4, 30);
       ctx.fillStyle = "#0b0e14";
       ctx.font = "bold 11px monospace";
       ctx.textAlign = "left";
-      ctx.fillText(this.fmtPx(lastPx), plotW + 6, ly + 4);
+      ctx.fillText(this.fmtPx(lastPx), plotW + 6, ly - 2);
+      ctx.font = "10px monospace";
+      ctx.fillText(this.fmtCountdown(liveBar.ct), plotW + 6, ly + 11);
     }
 
-    // ---- BOTTOM PANES: VOLUME, DELTA, CVD ----
+    // Bottom Panes: Volume, Delta, CVD
     const yVolBase = mainH + volH;
     const yDelMid = yVolBase + deltaH * 0.5 + 4;
     const yCvdTop = yVolBase + deltaH + 8;
@@ -430,18 +458,15 @@ class FootprintChart {
       const cx = (i + 0.5) * barStep;
       const xLeft = cx - barW / 2;
 
-      // Volume
       const vh = (b.v / maxV) * (volH - 6);
       ctx.fillStyle = b.c >= b.o ? "rgba(22,199,132,0.45)" : "rgba(234,57,67,0.45)";
       ctx.fillRect(xLeft, yVolBase - vh, barW, vh);
 
-      // Delta
       const dh = (Math.abs(b.delta) / maxAbsD) * (deltaH * 0.44);
       ctx.fillStyle = b.delta >= 0 ? "#16c784" : "#ea3943";
       if (b.delta >= 0) ctx.fillRect(xLeft, yDelMid - dh, barW, dh);
       else ctx.fillRect(xLeft, yDelMid, barW, dh);
 
-      // CVD line
       const cy = yCvdTop + 4 + ((cvdMax - b.cvd) / cvdSpan) * (cvdH - 8);
       if (i === 0) ctx.moveTo(cx, cy);
       else ctx.lineTo(cx, cy);
@@ -450,7 +475,8 @@ class FootprintChart {
     ctx.lineWidth = 1.5;
     ctx.stroke();
 
-    // Crosshair & Info Bar
+    // Crosshair or Live Bar Info
+    let infoBar = liveBar;
     if (this.mouseX !== null && this.mouseY !== null && this.mouseX < plotW) {
       ctx.save();
       ctx.setLineDash([3, 3]);
@@ -462,13 +488,8 @@ class FootprintChart {
       ctx.restore();
 
       const hIdx = Math.floor(this.mouseX / barStep);
-      if (hIdx >= 0 && hIdx < bars.length && this.infoEl) {
-        const hb = bars[hIdx];
-        const dt = new Date(hb.t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-        this.infoEl.innerHTML =
-          `<b>${dt}</b> · O: ${this.fmtPx(hb.o)}  H: ${this.fmtPx(hb.h)}  L: ${this.fmtPx(hb.l)}  C: ${this.fmtPx(hb.c)} · ` +
-          `Vol: ${this.fmtVol(hb.v)} · Delta: <span style="color:${hb.delta >= 0 ? '#16c784' : '#ea3943'}">${hb.delta >= 0 ? '+' : ''}${this.fmtVol(hb.delta)}</span> · ` +
-          `POC: ${this.fmtPx(hb.poc)} · CVD: ${this.fmtVol(hb.cvd)}`;
+      if (hIdx >= 0 && hIdx < bars.length) {
+        infoBar = bars[hIdx];
       }
       if (this.mouseY < mainH) {
         const hoverPx = pxOf(this.mouseY);
@@ -478,6 +499,15 @@ class FootprintChart {
         ctx.font = "11px monospace";
         ctx.fillText(this.fmtPx(hoverPx), plotW + 6, this.mouseY + 4);
       }
+    }
+
+    if (this.infoEl && infoBar) {
+      const dt = new Date(infoBar.t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      const fpTag = infoBar.fp ? `<span style="color:#16c784">[FP ON]</span>` : `<span style="color:#8b95a7">[OHLC]</span>`;
+      this.infoEl.innerHTML =
+        `<b>${dt}</b> ${fpTag} · O: ${this.fmtPx(infoBar.o)}  H: ${this.fmtPx(infoBar.h)}  L: ${this.fmtPx(infoBar.l)}  C: ${this.fmtPx(infoBar.c)} · ` +
+        `Vol: ${this.fmtVol(infoBar.v)} · Delta: <span style="color:${infoBar.delta >= 0 ? '#16c784' : '#ea3943'}">${infoBar.delta >= 0 ? '+' : ''}${this.fmtVol(infoBar.delta)}</span> · ` +
+        `POC: ${this.fmtPx(infoBar.poc)} · CVD: ${this.fmtVol(infoBar.cvd)}`;
     }
   }
 }
