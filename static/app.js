@@ -1,4 +1,5 @@
 let ws = null;
+let lastWsUpdateMs = 0;
 let currentSymbol = "BTCUSDT";
 let currentTf = "5m";
 const chart = new FootprintChart(
@@ -27,7 +28,6 @@ function showToast(msg) {
   setTimeout(() => el.classList.remove("show"), 5500);
 }
 
-// Navigation tabs
 document.querySelectorAll(".nav-btn").forEach((btn) => {
   btn.addEventListener("click", () => {
     document.querySelectorAll(".nav-btn").forEach((b) => b.classList.remove("active"));
@@ -41,7 +41,6 @@ document.querySelectorAll(".nav-btn").forEach((btn) => {
   });
 });
 
-// Timeframe buttons
 document.querySelectorAll(".tf-btn[data-tf]").forEach((btn) => {
   btn.addEventListener("click", () => {
     document.querySelectorAll(".tf-btn[data-tf]").forEach((b) => b.classList.remove("active"));
@@ -50,6 +49,7 @@ document.querySelectorAll(".tf-btn[data-tf]").forEach((btn) => {
     subscribeChart(currentSymbol, currentTf);
   });
 });
+document.getElementById("btn-fp-zoom").addEventListener("click", () => chart.setFootprintZoom());
 document.getElementById("btn-reset-zoom").addEventListener("click", () => chart.resetView());
 
 function subscribeChart(symbol, tf) {
@@ -57,11 +57,11 @@ function subscribeChart(symbol, tf) {
   currentTf = tf;
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ action: "subscribe", symbol, tf }));
-  } else {
-    fetch(`/api/chart/${symbol}?tf=${tf}`)
-      .then((r) => r.json())
-      .then((d) => renderChartPayload(d, true));
   }
+  fetch(`/api/chart/${symbol}?tf=${tf}&full=true`)
+    .then((r) => r.json())
+    .then((d) => renderChartPayload(d, true))
+    .catch(() => {});
 }
 
 function renderWatchlist(items) {
@@ -114,7 +114,6 @@ function renderChartPayload(data, resetPan = false) {
   stEl.textContent = data.scanner_note || data.scanner_state;
   stEl.className = `tag state-${data.scanner_state}`;
 
-  // Active signal bar
   const sigBar = document.getElementById("active-signal-bar");
   if (data.active_signals && data.active_signals.length > 0) {
     const s = data.active_signals[0];
@@ -134,7 +133,6 @@ function renderChartPayload(data, resetPan = false) {
     sigBar.innerHTML = `<span class="muted">${data.scanner_note || "Monitoring liquidity pools & orderflow confirmations..."}</span>`;
   }
 
-  // Liquidity pools right panel
   const liqEl = document.getElementById("liq-pools-list");
   liqEl.innerHTML = "";
   const bslTop = (data.bsl || []).slice(0, 4).reverse();
@@ -146,7 +144,6 @@ function renderChartPayload(data, resetPan = false) {
     liqEl.innerHTML += `<div class="liq-row liq-ssl"><span>${p.name} ${p.meta ? "· " + p.meta : ""}</span><b class="green">${fmtPx(p.price)}</b></div>`;
   }
 
-  // Orderbook depth
   const imbEl = document.getElementById("ob-imb");
   imbEl.textContent = `${data.ob_imbalance_pct >= 0 ? "+" : ""}${data.ob_imbalance_pct}%`;
   imbEl.className = `ob-imb ${data.ob_imbalance_pct >= 0 ? "green" : "red"}`;
@@ -167,6 +164,9 @@ function renderChartPayload(data, resetPan = false) {
     const isWall = bidWallPrices.has(p);
     return `<div class="ob-row ${isWall ? "wall" : ""}"><span class="green">${fmtPx(p)}</span><span>${fmtUsd(p * q)}</span></div>`;
   }).join("");
+
+  const clk = document.getElementById("live-clock");
+  if (clk) clk.textContent = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 function connectWS() {
@@ -176,13 +176,15 @@ function connectWS() {
 
   ws.onopen = () => {
     dot.classList.add("online");
+    lastWsUpdateMs = Date.now();
     ws.send(JSON.stringify({ action: "subscribe", symbol: currentSymbol, tf: currentTf }));
   };
   ws.onclose = () => {
     dot.classList.remove("online");
-    setTimeout(connectWS, 2500);
+    setTimeout(connectWS, 2000);
   };
   ws.onmessage = (evt) => {
+    lastWsUpdateMs = Date.now();
     const msg = JSON.parse(evt.data);
     if (msg.type === "init" || msg.type === "chart_full") {
       renderChartPayload(msg.chart, true);
@@ -201,6 +203,19 @@ function connectWS() {
     }
   };
 }
+
+// Guaranteed 1-second REST fallback if Cloud Shell proxy stalls WS
+setInterval(async () => {
+  if (Date.now() - lastWsUpdateMs < 1800) return;
+  try {
+    const res = await fetch(`/api/live/${currentSymbol}?tf=${currentTf}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    renderChartPayload(data.chart, false);
+    if (data.watchlist) renderWatchlist(data.watchlist);
+    if (data.stats) renderStats(data.stats);
+  } catch (_) {}
+}, 1000);
 
 async function loadSignals() {
   const res = await fetch("/api/signals?limit=60");
@@ -294,4 +309,5 @@ document.getElementById("btn-save-settings").addEventListener("click", async () 
   }
 });
 
+subscribeChart(currentSymbol, currentTf);
 connectWS();
