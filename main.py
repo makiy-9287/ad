@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
@@ -13,7 +14,7 @@ from pydantic import BaseModel
 
 from config import EngineConfig
 from database import Database
-from footprint_engine import FootprintCandle
+from footprint_engine import FootprintCandle, SymbolOrderflowState
 from liquidity_engine import LiquidityEngine
 from strategy_engine import StrategyEngine
 from telegram_bot import TelegramNotifier
@@ -76,6 +77,7 @@ async def handle_candle_closed(symbol: str, tf: str, closed_candle: FootprintCan
     state = collector.get_state(symbol)
     if state is None:
         return
+    state._cached_lmap_ts = 0.0  # force refresh on bar close
     sig = await strategy.on_candle_closed(symbol, tf, closed_candle, state)
     if sig is not None:
         await ws_manager.broadcast_event({"type": "signal_alert", "signal": sig, "stats": db.get_stats()})
@@ -87,7 +89,11 @@ async def handle_live_tick(symbol: str) -> None:
     state = collector.get_state(symbol)
     if state is None:
         return
-    await strategy.on_live_tick(symbol, state)
+    # Lightweight status check every 3s per symbol to avoid CPU load
+    now = time.monotonic()
+    if now - state._cached_lmap_ts >= 3.0:
+        await strategy.on_live_tick(symbol, state)
+        state._cached_lmap_ts = now
     updates = await tracker.process_price_tick(symbol, state.last_price)
     if updates:
         await ws_manager.broadcast_event({
@@ -95,6 +101,28 @@ async def handle_live_tick(symbol: str) -> None:
             "updates": updates,
             "stats": db.get_stats(),
         })
+
+
+async def handle_backfill_done(symbol: str) -> None:
+    if collector is None:
+        return
+    for ws, sub in list(ws_manager.clients.items()):
+        if sub["symbol"] == symbol:
+            try:
+                await ws.send_json({
+                    "type": "chart_full",
+                    "chart": build_chart_payload(symbol, sub["tf"], full=True),
+                })
+            except Exception:
+                pass
+
+
+def get_lmap_cached(state: SymbolOrderflowState, valid_tf: str, force: bool = False) -> Dict[str, Any]:
+    now = time.monotonic()
+    if force or not state._cached_lmap or (now - state._cached_lmap_ts >= 3.0):
+        state._cached_lmap = LiquidityEngine.build_liquidity_map(state, exec_tf=valid_tf)
+        state._cached_lmap_ts = now
+    return state._cached_lmap
 
 
 def build_chart_payload(symbol: str, tf: str, full: bool = True) -> Dict[str, Any]:
@@ -105,12 +133,19 @@ def build_chart_payload(symbol: str, tf: str, full: bool = True) -> Dict[str, An
         return {"symbol": symbol, "tf": tf, "candles": []}
 
     valid_tf = tf if tf in ("1m", "5m", "15m", "1h", "4h") else "5m"
+    settings = db.get_all_settings()
+    state.ensure_metrics_fresh(
+        valid_tf,
+        imbalance_ratio=float(settings.get("imbalance_ratio", 3.0)),
+        stacked_min=int(settings.get("stacked_min_rows", 3)),
+    )
+
     with state.lock:
         bars = list(state.candles.get(valid_tf, []))
         slice_bars = bars[-110:] if full else bars[-2:]
         candles_out = [b.to_dict(include_rows=True) for b in slice_bars]
-        bids = [[p, q] for p, q in state.bids[:15]]
-        asks = [[p, q] for p, q in state.asks[:15]]
+        bids = [[p, q] for p, q in state.bids[:12]]
+        asks = [[p, q] for p, q in state.asks[:12]]
         bid_walls = list(state.bid_walls)
         ask_walls = list(state.ask_walls)
         ob_imb = state.ob_imbalance_pct
@@ -119,16 +154,14 @@ def build_chart_payload(symbol: str, tf: str, full: bool = True) -> Dict[str, An
         oi = state.open_interest
         scanner_state = state.scanner_state
         scanner_note = state.scanner_note
-        recent_liqs = list(state.recent_liqs)[-12:]
 
-    lmap = LiquidityEngine.build_liquidity_map(state, exec_tf=valid_tf)
-    npocs = state.get_naked_pocs(valid_tf, max_count=8)
+    lmap = get_lmap_cached(state, valid_tf, force=full)
+    npocs = state.get_naked_pocs(valid_tf, max_count=6) if full else []
     vwap = state.get_session_vwap(valid_tf if valid_tf in ("1m", "5m", "15m") else "15m")
-    vp = state.get_visible_volume_profile(valid_tf, lookback=100)
+    vp = state.get_visible_volume_profile(valid_tf, lookback=100) if full else None
     active_sigs = db.get_active_signals(symbol)
-    recent_sigs = db.get_recent_signals(limit=25, symbol=symbol)
 
-    return {
+    out: Dict[str, Any] = {
         "symbol": symbol,
         "tf": valid_tf,
         "full": full,
@@ -140,8 +173,6 @@ def build_chart_payload(symbol: str, tf: str, full: bool = True) -> Dict[str, An
         "bias_1h": lmap["bias_1h"],
         "bias_4h": lmap["bias_4h"],
         "vwap": vwap,
-        "vp": vp,
-        "npocs": npocs,
         "bsl": lmap["bsl"],
         "ssl": lmap["ssl"],
         "bids": bids,
@@ -149,11 +180,13 @@ def build_chart_payload(symbol: str, tf: str, full: bool = True) -> Dict[str, An
         "bid_walls": bid_walls,
         "ask_walls": ask_walls,
         "ob_imbalance_pct": ob_imb,
-        "recent_liqs": recent_liqs,
         "candles": candles_out,
         "active_signals": active_sigs,
-        "recent_signals": recent_sigs,
     }
+    if full:
+        out["vp"] = vp
+        out["npocs"] = npocs
+    return out
 
 
 def build_watchlist_summary() -> List[Dict[str, Any]]:
@@ -179,16 +212,14 @@ def build_watchlist_summary() -> List[Dict[str, Any]]:
 
 
 async def ui_broadcast_loop() -> None:
-    tick_counter = 0
     while True:
         try:
-            await asyncio.sleep(0.65)
-            tick_counter += 1
+            await asyncio.sleep(1.0)
             if not ws_manager.clients:
                 continue
 
-            watchlist_data = build_watchlist_summary() if tick_counter % 2 == 0 else None
-            # Cache chart payloads per (symbol, tf) for connected clients
+            watchlist_data = build_watchlist_summary()
+            stats_data = db.get_stats()
             payload_cache: Dict[tuple, Dict[str, Any]] = {}
             dead: List[WebSocket] = []
 
@@ -199,10 +230,9 @@ async def ui_broadcast_loop() -> None:
                 msg: Dict[str, Any] = {
                     "type": "live_update",
                     "chart": payload_cache[key],
+                    "watchlist": watchlist_data,
+                    "stats": stats_data,
                 }
-                if watchlist_data is not None:
-                    msg["watchlist"] = watchlist_data
-                    msg["stats"] = db.get_stats()
                 try:
                     await ws.send_json(msg)
                 except Exception:
@@ -212,7 +242,7 @@ async def ui_broadcast_loop() -> None:
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.warning("UI broadcast loop warning: %s", e)
+            logger.exception("UI broadcast loop error: %s", e)
 
 
 @asynccontextmanager
@@ -224,6 +254,7 @@ async def lifespan(app: FastAPI):
         get_settings_fn=db.get_all_settings,
         on_candle_closed=handle_candle_closed,
         on_live_tick=handle_live_tick,
+        on_backfill_done=handle_backfill_done,
     )
     settings = db.get_all_settings()
     await collector.start(settings.get("watchlist", []))
@@ -260,8 +291,21 @@ async def api_watchlist():
 
 
 @app.get("/api/chart/{symbol}")
-async def api_chart(symbol: str, tf: str = "5m"):
-    return build_chart_payload(symbol.upper(), tf, full=True)
+async def api_chart(symbol: str, tf: str = "5m", full: bool = True):
+    sym = symbol.upper()
+    if collector:
+        collector.prioritize_backfill(sym)
+    return build_chart_payload(sym, tf, full=full)
+
+
+@app.get("/api/live/{symbol}")
+async def api_live(symbol: str, tf: str = "5m"):
+    sym = symbol.upper()
+    return {
+        "chart": build_chart_payload(sym, tf, full=False),
+        "watchlist": build_watchlist_summary(),
+        "stats": db.get_stats(),
+    }
 
 
 @app.get("/api/signals")
@@ -337,6 +381,8 @@ async def websocket_endpoint(ws: WebSocket):
     await ws_manager.connect(ws)
     try:
         sub = ws_manager.clients[ws]
+        if collector:
+            collector.prioritize_backfill(sub["symbol"])
         await ws.send_json({
             "type": "init",
             "chart": build_chart_payload(sub["symbol"], sub["tf"], full=True),
@@ -349,6 +395,8 @@ async def websocket_endpoint(ws: WebSocket):
                 sym = str(msg.get("symbol", "BTCUSDT")).upper()
                 tf = str(msg.get("tf", "5m"))
                 ws_manager.set_sub(ws, sym, tf)
+                if collector:
+                    collector.prioritize_backfill(sym)
                 await ws.send_json({
                     "type": "chart_full",
                     "chart": build_chart_payload(sym, tf, full=True),
