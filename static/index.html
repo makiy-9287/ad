@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OrderFlowX · Binance Futures Liquidity & Footprint Terminal</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="pulse-dot" id="conn-dot"></span>
+      <span class="brand-title">ORDERFLOW<span class="accent">X</span></span>
+      <span class="brand-sub">Binance Perp · Liquidity & Footprint</span>
+    </div>
+
+    <div class="top-stats" id="top-stats">
+      <div class="stat-pill"><span>Closed</span><b id="st-total">0</b></div>
+      <div class="stat-pill"><span>Win Rate</span><b id="st-wr" class="green">0%</b></div>
+      <div class="stat-pill"><span>Net R</span><b id="st-r">+0.0R</b></div>
+    </div>
+
+    <nav class="nav-tabs">
+      <button class="nav-btn active" data-view="terminal">Terminal & Chart</button>
+      <button class="nav-btn" data-view="signals">Signals History</button>
+      <button class="nav-btn" data-view="settings">Settings & Telegram</button>
+    </nav>
+  </header>
+
+  <!-- VIEW 1: TERMINAL & FOOTPRINT CHART -->
+  <main id="view-terminal" class="view active">
+    <aside class="sidebar">
+      <div class="panel-header">
+        <span>10-COIN SCANNER</span>
+        <span class="badge-live">LIVE</span>
+      </div>
+      <div id="watchlist-container" class="watchlist"></div>
+    </aside>
+
+    <section class="chart-area">
+      <div class="chart-toolbar">
+        <div class="coin-head">
+          <h2 id="hdr-symbol">BTCUSDT</h2>
+          <span id="hdr-price" class="hdr-price">--</span>
+          <span id="hdr-chg" class="hdr-chg">--</span>
+          <span id="hdr-bias" class="tag">1H: --</span>
+          <span id="hdr-status" class="tag state-scanning">SCANNING</span>
+        </div>
+
+        <div class="tf-group">
+          <button class="tf-btn" data-tf="1m">1m</button>
+          <button class="tf-btn active" data-tf="5m">5m</button>
+          <button class="tf-btn" data-tf="15m">15m</button>
+          <button class="tf-btn" data-tf="1h">1h</button>
+          <button class="tf-btn" id="btn-reset-zoom" title="Double-click chart to reset">Reset Zoom</button>
+        </div>
+      </div>
+
+      <div class="bar-info" id="bar-info">
+        Hover or scroll to zoom in for Bid × Ask Footprint cells · Drag to pan
+      </div>
+
+      <div class="canvas-wrap">
+        <canvas id="fp-canvas"></canvas>
+      </div>
+
+      <!-- Active Signal Card Banner below chart -->
+      <div class="active-signal-bar" id="active-signal-bar">
+        <span class="muted">No active signal on this coin right now. Engine is monitoring liquidity pools & orderflow confirmations.</span>
+      </div>
+    </section>
+
+    <aside class="right-panel">
+      <div class="panel-header">
+        <span>ORDERBOOK & LIQUIDITY</span>
+        <span id="ob-imb" class="ob-imb">0%</span>
+      </div>
+
+      <div class="sub-card">
+        <div class="sub-title">Key Liquidity Pools (BSL / SSL)</div>
+        <div id="liq-pools-list" class="liq-list"></div>
+      </div>
+
+      <div class="sub-card ob-card">
+        <div class="sub-title">Live Orderbook Depth (Walls Highlighted)</div>
+        <div class="ob-book">
+          <div id="ob-asks" class="ob-side"></div>
+          <div class="ob-spread" id="ob-spread">--</div>
+          <div id="ob-bids" class="ob-side"></div>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <!-- VIEW 2: SIGNALS HISTORY -->
+  <section id="view-signals" class="view view-padded">
+    <div class="card">
+      <div class="card-head">
+        <h3>Confirmed Signals & Live Auto-Tracker</h3>
+        <button class="btn-secondary" id="btn-refresh-signals">Refresh</button>
+      </div>
+      <div class="table-wrap">
+        <table class="sig-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Coin</th>
+              <th>Mode</th>
+              <th>Side</th>
+              <th>Entry Zone</th>
+              <th>Stop Loss</th>
+              <th>TP1 (BE)</th>
+              <th>TP2</th>
+              <th>RR</th>
+              <th>Score</th>
+              <th>Status</th>
+              <th>PnL (R)</th>
+              <th>Confirmation Reason</th>
+            </tr>
+          </thead>
+          <tbody id="signals-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- VIEW 3: SETTINGS & TELEGRAM -->
+  <section id="view-settings" class="view view-padded">
+    <div class="settings-grid">
+      <div class="card">
+        <h3>Telegram Bot Alerts</h3>
+        <p class="muted">Enter your Telegram Bot Token &amp; Chat ID, click Test Alert, then Save.</p>
+
+        <label class="field-label">Telegram Bot Token</label>
+        <input type="text" id="set-tg-token" class="input" placeholder="123456789:ABCdefGHIjklMNO..." />
+
+        <label class="field-label">Telegram Chat ID</label>
+        <input type="text" id="set-tg-chat" class="input" placeholder="-1001234567890 or 987654321" />
+
+        <label class="check-row">
+          <input type="checkbox" id="set-tg-enabled" />
+          <span>Enable Telegram Signal &amp; TP/SL Alerts</span>
+        </label>
+
+        <div class="btn-row">
+          <button class="btn-secondary" id="btn-test-tg">Send Test Alert</button>
+          <button class="btn-primary" id="btn-save-settings">Save All Settings</button>
+        </div>
+        <div id="tg-feedback" class="feedback"></div>
+      </div>
+
+      <div class="card">
+        <h3>Strategy &amp; Scanner Engine</h3>
+
+        <label class="check-row">
+          <input type="checkbox" id="set-scalp-en" />
+          <span>Enable Scalping Mode (1H Bias · 15m Sweep · 5m Orderflow MSS)</span>
+        </label>
+
+        <label class="check-row">
+          <input type="checkbox" id="set-day-en" />
+          <span>Enable Day Mode (4H/1H Bias · 1H Sweep · 15m Orderflow MSS)</span>
+        </label>
+
+        <div class="two-col">
+          <div>
+            <label class="field-label">Minimum RR (e.g. 2.0)</label>
+            <input type="number" step="0.1" min="1.5" max="5.0" id="set-min-rr" class="input" />
+          </div>
+          <div>
+            <label class="field-label">Imbalance Ratio (e.g. 3.0 = 300%)</label>
+            <input type="number" step="0.5" min="1.5" max="10" id="set-imb-ratio" class="input" />
+          </div>
+          <div>
+            <label class="field-label">SL Buffer % Beyond Wick</label>
+            <input type="number" step="0.01" min="0.02" max="0.5" id="set-sl-buf" class="input" />
+          </div>
+          <div>
+            <label class="field-label">Signal Cooldown (Minutes)</label>
+            <input type="number" step="5" min="10" max="240" id="set-cooldown" class="input" />
+          </div>
+        </div>
+
+        <label class="field-label">Monitored Binance USDT-M Watchlist (comma separated, max 15)</label>
+        <textarea id="set-watchlist" class="input textarea" rows="3"></textarea>
+      </div>
+    </div>
+  </section>
+
+  <div id="toast" class="toast"></div>
+
+  <script src="/static/footprint_chart.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
